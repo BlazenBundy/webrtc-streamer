@@ -37,7 +37,7 @@ func main() {
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
 
 	// Explicitly force your server's public IP for browser WebRTC connectivity
-	settingEngine.SetNAT1To1IPs([]string{"125.63.25.226"}, webrtc.ICECandidateTypeHost)
+	settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
