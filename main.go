@@ -145,7 +145,7 @@ func main() {
 			"-vf", "scale=1280:-2",
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
-			"-profile:v", "constrained_baseline",
+			"-profile:v", "baseline",
 			"-level:v", "3.1",
 			"-preset", "ultrafast",
 			"-tune", "zerolatency",
@@ -155,7 +155,7 @@ func main() {
 			"-x264-params", "slice-max-size=1200",
 			"-g", "15",
 			"-keyint_min", "15",
-			"-sc_threshold", "0",
+			"-sc_threshold", "0", 
 			"-f", "h264",
 			"pipe:1",
 		)
