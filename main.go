@@ -140,10 +140,8 @@ func main() {
 		log.Printf("[%s] Receiving raw HEVC stream from Express, starting FFmpeg...", station)
 
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
-			"-fflags", "nobuffer",
-			"-flags", "low_delay",
 			"-f", "hevc",
-			"-i", "pipe:0", 
+			"-i", "pipe:0",
 			"-vf", "scale=1280:-2",
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
@@ -151,7 +149,7 @@ func main() {
 			"-level:v", "3.1",
 			"-preset", "ultrafast",
 			"-tune", "zerolatency",
-			"-x264-params", "slice-max-size=1200",
+			"-x264-params", "slice-max-size=1200:keyint=15:min-keyint=15",
 			"-g", "15",
 			"-r", "15",
 			"-f", "h264",
