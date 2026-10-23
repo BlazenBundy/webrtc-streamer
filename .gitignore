@@ -1,0 +1,5 @@
+stream-server
+*.mp4
+*.mkv
+*.ts
+.env
