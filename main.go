@@ -38,6 +38,12 @@ func main() {
 	// Explicitly force your server's public IP for browser WebRTC connectivity
 	settingEngine.SetNAT1To1IPs([]string{"125.63.25.226"}, webrtc.ICECandidateTypeHost)
 
+	// Explicitly filter out any stray 0.0.0.0 or local IPs from being added to candidates
+	settingEngine.SetIPFilter(func(ip net.IP) bool {
+		// Only allow external/public or specific bindings, block wildcard 0.0.0.0
+		return !ip.IsUnspecified()
+	})
+
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
 	// 1. WebRTC Offer Endpoint (Called by Express when Frontend Modal opens)
