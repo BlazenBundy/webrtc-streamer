@@ -158,6 +158,7 @@ func main() {
 		)
 
 		cmd.Stdin = r.Body
+		cmd.Stderr = os.Stderr
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -175,7 +176,7 @@ func main() {
 			log.Printf("[%s] H264 reader error: %v", station, err)
 			return
 		}
-
+		sentFirstFrame := false
 		for {
 			nal, err := h264.NextNAL()
 			if err == io.EOF {
@@ -184,6 +185,11 @@ func main() {
 			if err != nil {
 				log.Printf("[%s] NAL read error: %v", station, err)
 				break
+			}
+
+			if !sentFirstFrame {
+				log.Printf("[%s] SUCCESS: First H.264 NAL unit produced by FFmpeg (Type: %d, Size: %d bytes)", station, nal.UnitType, len(nal.Data))
+				sentFirstFrame = true
 			}
 
 			isFrame := nal.UnitType == h264reader.NalUnitTypeCodedSliceNonIdr ||
