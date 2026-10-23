@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,7 +26,7 @@ var (
 func main() {
 	settingEngine := webrtc.SettingEngine{}
 
-	// 1. Explicitly bind the UDP listener to port 8443 for host networking
+	// Bind the explicit UDP listener to port 8443 for host networking
 	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.IP{0, 0, 0, 0},
 		Port: 8443,
@@ -35,7 +36,7 @@ func main() {
 	}
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
 
-	// 2. Force strict 1-to-1 NAT mapping to your public IP
+	// Explicitly force your server's public IP for browser WebRTC connectivity
 	settingEngine.SetNAT1To1IPs([]string{"125.63.25.226"}, webrtc.ICECandidateTypeHost)
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
