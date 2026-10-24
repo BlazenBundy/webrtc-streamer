@@ -342,7 +342,8 @@ func main() {
 			return
 		}
 
-		w.Header().Set("Content-Type", "video/mp2t")
+		w.Header().Set("Content-Type", "video/mp4")
+
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
 			"-init_hw_device", "vaapi=va:/dev/dri/renderD128",
 			"-init_hw_device", "qsv=qs@va",
@@ -355,7 +356,8 @@ func main() {
 			"-c:v", "h264_qsv",
 			"-b:v", "2000k",
 			"-c:a", "aac",
-			"-f", "mpegts",
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 			"pipe:1",
 		)
 		
