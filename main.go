@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -20,14 +21,12 @@ import (
 // Holds active WebRTC video tracks by Eufy stationSerial
 var (
 	tracksMu sync.RWMutex
-	// Updated to hold an array (slice) of tracks for multiple viewers
-	tracks = make(map[string][]*webrtc.TrackLocalStaticSample)
+	tracks   = make(map[string][]*webrtc.TrackLocalStaticSample)
 )
 
 func main() {
 	settingEngine := webrtc.SettingEngine{}
 
-	// Bind the explicit UDP listener to port 8443 for host networking
 	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
 		IP:   net.IP{0, 0, 0, 0},
 		Port: 8443,
@@ -36,13 +35,14 @@ func main() {
 		log.Fatalf("Failed to bind UDP port 8443: %v", err)
 	}
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
-
-	// Explicitly force your server's public IP for browser WebRTC connectivity
 	settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
-	// 1. WebRTC Offer Endpoint
+	// =========================================================================
+	// 1. PRIMARY SECURITY CAMERA ROUTES (Intact & Isolated)
+	// =========================================================================
+
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		station := r.URL.Query().Get("station")
 		if station == "" {
@@ -57,9 +57,7 @@ func main() {
 		}
 
 		peerConnection, err := api.NewPeerConnection(webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{
-				{URLs: []string{"stun:stun.l.google.com:19302"}},
-			},
+			ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -91,7 +89,6 @@ func main() {
 			}
 		}()
 
-		// Append the new viewer's track to the station's slice
 		tracksMu.Lock()
 		tracks[station] = append(tracks[station], videoTrack)
 		tracksMu.Unlock()
@@ -101,8 +98,7 @@ func main() {
 			if state == webrtc.ICEConnectionStateDisconnected ||
 				state == webrtc.ICEConnectionStateFailed ||
 				state == webrtc.ICEConnectionStateClosed {
-				
-				// Safely remove only this specific viewer's track when they disconnect
+
 				tracksMu.Lock()
 				activeTracks := tracks[station]
 				for i, t := range activeTracks {
@@ -138,7 +134,6 @@ func main() {
 		json.NewEncoder(w).Encode(peerConnection.LocalDescription())
 	})
 
-	// 2. Raw Ingest Endpoint (Dynamically handles H.264 or HEVC)
 	http.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
 		station := r.URL.Query().Get("station")
 		if station == "" {
@@ -146,7 +141,6 @@ func main() {
 			return
 		}
 
-		// Grab the codec sent from Express (default to hevc if missing)
 		inputCodec := r.URL.Query().Get("codec")
 		if inputCodec != "h264" {
 			inputCodec = "hevc"
@@ -155,9 +149,9 @@ func main() {
 		log.Printf("[%s] Receiving raw %s stream from Express, starting FFmpeg...", station, inputCodec)
 
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
-			"-f", inputCodec, // Dynamically read the input format
+			"-f", inputCodec,
 			"-i", "pipe:0",
-			"-vf", "scale=1280:-2", 
+			"-vf", "scale=1280:-2",
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
 			"-profile:v", "baseline",
@@ -216,12 +210,10 @@ func main() {
 				duration = time.Second / 15
 			}
 
-			// Safely copy the list of active viewers to avoid blocking new connections
 			tracksMu.RLock()
 			activeTracks := append([]*webrtc.TrackLocalStaticSample{}, tracks[station]...)
 			tracksMu.RUnlock()
 
-			// Broadcast the frame to every connected viewer
 			for _, track := range activeTracks {
 				_ = track.WriteSample(media.Sample{Data: nal.Data, Duration: duration})
 			}
@@ -230,6 +222,132 @@ func main() {
 		_ = cmd.Wait()
 		log.Printf("[%s] Ingest stream ended", station)
 		w.WriteHeader(http.StatusOK)
+	})
+
+	// =========================================================================
+	// 2. EXPANDED MEDIA ENGINE ROUTES (Independent & QSV Accelerated)
+	// =========================================================================
+
+	// AI Snapshot Extractor: Pass a stream URL, instantly returns a JPEG buffer
+	http.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		streamURL := r.URL.Query().Get("url")
+		if streamURL == "" {
+			http.Error(w, "Missing url parameter", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "image/jpeg")
+		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+			"-i", streamURL,
+			"-vframes", "1",
+			"-q:v", "2",
+			"-f", "image2",
+			"pipe:1",
+		)
+		cmd.Stdout = w
+		_ = cmd.Run()
+	})
+
+	// Hardware DVR Archiver: Saves an incoming stream directly to rolling HLS chunks on disk
+	http.HandleFunc("/archive", func(w http.ResponseWriter, r *http.Request) {
+		streamID := r.URL.Query().Get("id")
+		if streamID == "" {
+			http.Error(w, "Missing id parameter", http.StatusBadRequest)
+			return
+		}
+
+		outDir := filepath.Join("/mnt/dvr", streamID)
+		_ = os.MkdirAll(outDir, 0755)
+		outPath := filepath.Join(outDir, "index.m3u8")
+
+		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+			"-i", "pipe:0",
+			"-c:v", "h264_qsv", // Intel QuickSync Hardware Encoding
+			"-preset", "veryfast",
+			"-f", "hls",
+			"-hls_time", "10",
+			"-hls_list_size", "100", // Keep last 100 chunks
+			"-hls_flags", "delete_segments",
+			outPath,
+		)
+		cmd.Stdin = r.Body
+		go func() {
+			if err := cmd.Run(); err != nil {
+				log.Printf("[DVR] Archiver stopped for %s: %v", streamID, err)
+			}
+		}()
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Archiving started for %s", streamID)
+	})
+
+	// Heavy Transcoder: Downscales heavy 4K/RTSP streams to 720p using QSV
+	http.HandleFunc("/transcode", func(w http.ResponseWriter, r *http.Request) {
+		streamURL := r.URL.Query().Get("url")
+		if streamURL == "" {
+			http.Error(w, "Missing url parameter", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "video/mp2t")
+		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+			"-hwaccel", "qsv", // Hardware Decode
+			"-i", streamURL,
+			"-vf", "scale_qsv=1280:-2", // Hardware Scale
+			"-c:v", "h264_qsv",         // Hardware Encode
+			"-b:v", "2000k",
+			"-c:a", "aac",
+			"-f", "mpegts",
+			"pipe:1",
+		)
+		cmd.Stdout = w
+		_ = cmd.Run()
+	})
+
+	// Timelapse Generator: Stitches standard chunks into a hyper-lapse
+	http.HandleFunc("/timelapse", func(w http.ResponseWriter, r *http.Request) {
+		dateStr := r.URL.Query().Get("date") // e.g. 2026-10-24
+		if dateStr == "" {
+			http.Error(w, "Missing date parameter", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "video/mp4")
+		inputPath := fmt.Sprintf("/mnt/dvr/camera1/%s_*.ts", dateStr) // Glob pattern
+		
+		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+			"-pattern_type", "glob",
+			"-i", inputPath,
+			"-filter:v", "setpts=0.02*PTS", // Speed up 50x
+			"-an", // Drop audio
+			"-c:v", "h264_qsv",
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov",
+			"pipe:1",
+		)
+		cmd.Stdout = w
+		_ = cmd.Run()
+	})
+
+	// Audio Intelligence: Extracts a clean 16kHz WAV for Whisper/Transcription pipelines
+	http.HandleFunc("/transcribe", func(w http.ResponseWriter, r *http.Request) {
+		streamURL := r.URL.Query().Get("url")
+		if streamURL == "" {
+			http.Error(w, "Missing url parameter", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "audio/wav")
+		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+			"-i", streamURL,
+			"-vn", // Drop video
+			"-acodec", "pcm_s16le",
+			"-ar", "16000",
+			"-ac", "1",
+			"-f", "wav",
+			"pipe:1",
+		)
+		cmd.Stdout = w
+		_ = cmd.Run()
 	})
 
 	fmt.Println("Streaming server listening on :8080 (Internal HTTP) and :8443/udp (Public WebRTC)")
