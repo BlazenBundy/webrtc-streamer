@@ -145,15 +145,14 @@ func main() {
 			"-vf", "scale=1280:-2", 
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
-			"-profile:v", "main", // CRITICAL: Required for intra-refresh
+			"-profile:v", "baseline", // Reverting to Baseline for maximum SDP compatibility
 			"-level:v", "3.1",
 			"-preset", "ultrafast",
 			"-tune", "zerolatency",
-			"-b:v", "1500k",
-			"-maxrate", "1500k",
-			"-bufsize", "3000k",
-			"-x264-params", "intra-refresh=1", // Eliminates I-frame network bursts
-			"-g", "15",
+			"-b:v", "800k",
+			"-maxrate", "800k",
+			"-bufsize", "400k", // Strict choke on burst size
+			"-g", "15",         // Force a full recovery frame every 1 second
 			"-f", "h264",
 			"pipe:1",
 		)
