@@ -344,8 +344,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "video/mp2t")
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
-			"-hwaccel", "qsv",
-			"-qsv_device", "/dev/dri/renderD128", 
+			"-hwaccel", "qsv", 
 			"-i", streamURL,
 			"-vf", "scale_qsv=1280:-2", 
 			"-c:v", "h264_qsv",         
