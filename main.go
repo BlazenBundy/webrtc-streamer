@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,13 +19,13 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 )
 
-// Holds active WebRTC video tracks by Eufy stationSerial
 var (
 	tracksMu sync.RWMutex
 	tracks   = make(map[string][]*webrtc.TrackLocalStaticSample)
 )
 
 func main() {
+	log.Println("[SYSTEM] Initializing MS-01 Media Engine...")
 	settingEngine := webrtc.SettingEngine{}
 
 	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
@@ -32,26 +33,32 @@ func main() {
 		Port: 8443,
 	})
 	if err != nil {
-		log.Fatalf("Failed to bind UDP port 8443: %v", err)
+		log.Fatalf("[SYSTEM-FATAL] Failed to bind UDP port 8443: %v", err)
 	}
+	
+	log.Println("[SYSTEM] WebRTC UDP Listener bound to 0.0.0.0:8443")
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
 	settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
 	// =========================================================================
-	// 1. PRIMARY SECURITY CAMERA ROUTES (Intact & Isolated)
+	// 1. PRIMARY SECURITY CAMERA ROUTES
 	// =========================================================================
 
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		station := r.URL.Query().Get("station")
+		log.Printf("[WEBRTC-OFFER] Incoming WebRTC connection request for station: '%s'", station)
+		
 		if station == "" {
+			log.Println("[WEBRTC-OFFER] Error: Missing station query param")
 			http.Error(w, "Missing station query param", http.StatusBadRequest)
 			return
 		}
 
 		var offer webrtc.SessionDescription
 		if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error decoding SDP offer: %v", station, err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -60,6 +67,7 @@ func main() {
 			ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 		})
 		if err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error creating PeerConnection: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -70,12 +78,14 @@ func main() {
 			"eufy-"+station,
 		)
 		if err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error creating track: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		rtpSender, err := peerConnection.AddTrack(videoTrack)
 		if err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error adding track: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -91,10 +101,13 @@ func main() {
 
 		tracksMu.Lock()
 		tracks[station] = append(tracks[station], videoTrack)
+		viewerCount := len(tracks[station])
 		tracksMu.Unlock()
+		
+		log.Printf("[WEBRTC-OFFER] [%s] Track added. Active viewers: %d", station, viewerCount)
 
 		peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-			log.Printf("[%s] ICE State: %s", station, state.String())
+			log.Printf("[WEBRTC-ICE] [%s] State changed to: %s", station, state.String())
 			if state == webrtc.ICEConnectionStateDisconnected ||
 				state == webrtc.ICEConnectionStateFailed ||
 				state == webrtc.ICEConnectionStateClosed {
@@ -107,29 +120,36 @@ func main() {
 						break
 					}
 				}
+				newCount := len(tracks[station])
 				tracksMu.Unlock()
+				
+				log.Printf("[WEBRTC-ICE] [%s] Viewer disconnected. Remaining viewers: %d", station, newCount)
 				peerConnection.Close()
 			}
 		})
 
 		if err = peerConnection.SetRemoteDescription(offer); err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error setting remote description: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		answer, err := peerConnection.CreateAnswer(nil)
 		if err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error creating answer: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
 		if err = peerConnection.SetLocalDescription(answer); err != nil {
+			log.Printf("[WEBRTC-OFFER] [%s] Error setting local description: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		<-gatherComplete
 
+		log.Printf("[WEBRTC-OFFER] [%s] Successfully negotiated WebRTC connection", station)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(peerConnection.LocalDescription())
 	})
@@ -137,6 +157,7 @@ func main() {
 	http.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
 		station := r.URL.Query().Get("station")
 		if station == "" {
+			log.Println("[INGEST] Error: Missing station query param")
 			http.Error(w, "Missing station query param", http.StatusBadRequest)
 			return
 		}
@@ -146,7 +167,7 @@ func main() {
 			inputCodec = "hevc"
 		}
 
-		log.Printf("[%s] Receiving raw %s stream from Express, starting FFmpeg...", station, inputCodec)
+		log.Printf("[INGEST] [%s] Receiving stream, codec: %s. Starting internal FFmpeg...", station, inputCodec)
 
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
 			"-f", inputCodec,
@@ -168,37 +189,40 @@ func main() {
 		)
 
 		cmd.Stdin = r.Body
-		cmd.Stderr = os.Stderr
+		cmd.Stderr = os.Stderr 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			log.Printf("[INGEST] [%s] StdoutPipe error: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		if err := cmd.Start(); err != nil {
-			log.Printf("[%s] FFmpeg start error: %v", station, err)
+			log.Printf("[INGEST] [%s] FFmpeg process failed to start: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		h264, err := h264reader.NewReader(stdout)
 		if err != nil {
-			log.Printf("[%s] H264 reader error: %v", station, err)
+			log.Printf("[INGEST] [%s] H264 reader initialization error: %v", station, err)
 			return
 		}
+		
 		sentFirstFrame := false
 		for {
 			nal, err := h264.NextNAL()
 			if err == io.EOF {
+				log.Printf("[INGEST] [%s] Reached EOF from FFmpeg stdout", station)
 				break
 			}
 			if err != nil {
-				log.Printf("[%s] NAL read error: %v", station, err)
+				log.Printf("[INGEST] [%s] NAL read error: %v", station, err)
 				break
 			}
 
 			if !sentFirstFrame {
-				log.Printf("[%s] SUCCESS: First H.264 NAL unit produced by FFmpeg (Type: %d, Size: %d bytes)", station, nal.UnitType, len(nal.Data))
+				log.Printf("[INGEST] [%s] SUCCESS: First H.264 NAL unit generated (Type: %d, Size: %d bytes)", station, nal.UnitType, len(nal.Data))
 				sentFirstFrame = true
 			}
 
@@ -219,19 +243,25 @@ func main() {
 			}
 		}
 
-		_ = cmd.Wait()
-		log.Printf("[%s] Ingest stream ended", station)
+		err = cmd.Wait()
+		if err != nil {
+			log.Printf("[INGEST] [%s] FFmpeg exited with error: %v", station, err)
+		} else {
+			log.Printf("[INGEST] [%s] FFmpeg stream ended cleanly", station)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
 	// =========================================================================
-	// 2. EXPANDED MEDIA ENGINE ROUTES (Independent & QSV Accelerated)
+	// 2. EXPANDED MEDIA ENGINE ROUTES 
 	// =========================================================================
 
-	// AI Snapshot Extractor: Pass a stream URL, instantly returns a JPEG buffer
 	http.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		streamURL := r.URL.Query().Get("url")
+		log.Printf("[SNAPSHOT] Request initiated for URL: %s", streamURL)
+		
 		if streamURL == "" {
+			log.Println("[SNAPSHOT] Error: Missing url parameter")
 			http.Error(w, "Missing url parameter", http.StatusBadRequest)
 			return
 		}
@@ -244,94 +274,140 @@ func main() {
 			"-f", "image2",
 			"pipe:1",
 		)
+		
+		var stderrBuf bytes.Buffer
 		cmd.Stdout = w
-		_ = cmd.Run()
+		cmd.Stderr = &stderrBuf 
+		
+		if err := cmd.Run(); err != nil {
+			log.Printf("[SNAPSHOT] FFmpeg execution failed. Error: %v", err)
+			log.Printf("[SNAPSHOT] FFmpeg Stderr Output:\n%s", stderrBuf.String())
+		} else {
+			log.Println("[SNAPSHOT] Successfully processed and returned image buffer")
+		}
 	})
 
-	// Hardware DVR Archiver: Saves an incoming stream directly to rolling HLS chunks on disk
 	http.HandleFunc("/archive", func(w http.ResponseWriter, r *http.Request) {
 		streamID := r.URL.Query().Get("id")
+		log.Printf("[ARCHIVE] DVR recording requested for ID: %s", streamID)
+		
 		if streamID == "" {
+			log.Println("[ARCHIVE] Error: Missing id parameter")
 			http.Error(w, "Missing id parameter", http.StatusBadRequest)
 			return
 		}
 
 		outDir := filepath.Join("/mnt/dvr", streamID)
-		_ = os.MkdirAll(outDir, 0755)
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			log.Printf("[ARCHIVE] Error creating directory %s: %v", outDir, err)
+		}
 		outPath := filepath.Join(outDir, "index.m3u8")
 
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
 			"-i", "pipe:0",
-			"-c:v", "h264_qsv", // Intel QuickSync Hardware Encoding
+			"-c:v", "h264_qsv", 
 			"-preset", "veryfast",
 			"-f", "hls",
 			"-hls_time", "10",
-			"-hls_list_size", "100", // Keep last 100 chunks
+			"-hls_list_size", "100", 
 			"-hls_flags", "delete_segments",
 			outPath,
 		)
 		cmd.Stdin = r.Body
+		
 		go func() {
+			var stderrBuf bytes.Buffer
+			cmd.Stderr = &stderrBuf
+			log.Printf("[ARCHIVE] Starting background QSV encoding to %s", outPath)
+			
 			if err := cmd.Run(); err != nil {
-				log.Printf("[DVR] Archiver stopped for %s: %v", streamID, err)
+				log.Printf("[ARCHIVE] [%s] Process stopped with error: %v", streamID, err)
+				log.Printf("[ARCHIVE] [%s] Stderr Output:\n%s", streamID, stderrBuf.String())
+			} else {
+				log.Printf("[ARCHIVE] [%s] Process finished gracefully", streamID)
 			}
 		}()
+		
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Archiving started for %s", streamID)
 	})
 
-	// Heavy Transcoder: Downscales heavy 4K/RTSP streams to 720p using QSV
 	http.HandleFunc("/transcode", func(w http.ResponseWriter, r *http.Request) {
 		streamURL := r.URL.Query().Get("url")
+		log.Printf("[TRANSCODE] Request initiated for URL: %s", streamURL)
+		
 		if streamURL == "" {
+			log.Println("[TRANSCODE] Error: Missing url parameter")
 			http.Error(w, "Missing url parameter", http.StatusBadRequest)
 			return
 		}
 
 		w.Header().Set("Content-Type", "video/mp2t")
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
-			"-hwaccel", "qsv", // Hardware Decode
+			"-hwaccel", "qsv", 
 			"-i", streamURL,
-			"-vf", "scale_qsv=1280:-2", // Hardware Scale
-			"-c:v", "h264_qsv",         // Hardware Encode
+			"-vf", "scale_qsv=1280:-2", 
+			"-c:v", "h264_qsv",         
 			"-b:v", "2000k",
 			"-c:a", "aac",
 			"-f", "mpegts",
 			"pipe:1",
 		)
+		
+		var stderrBuf bytes.Buffer
 		cmd.Stdout = w
-		_ = cmd.Run()
+		cmd.Stderr = &stderrBuf
+		
+		if err := cmd.Run(); err != nil {
+			log.Printf("[TRANSCODE] Execution failed for %s. Error: %v", streamURL, err)
+			log.Printf("[TRANSCODE] Stderr Output:\n%s", stderrBuf.String())
+		} else {
+			log.Printf("[TRANSCODE] Successfully completed stream proxy for %s", streamURL)
+		}
 	})
 
-	// Timelapse Generator: Stitches standard chunks into a hyper-lapse
 	http.HandleFunc("/timelapse", func(w http.ResponseWriter, r *http.Request) {
-		dateStr := r.URL.Query().Get("date") // e.g. 2026-10-24
+		dateStr := r.URL.Query().Get("date") 
+		log.Printf("[TIMELAPSE] Generation requested for date: %s", dateStr)
+		
 		if dateStr == "" {
+			log.Println("[TIMELAPSE] Error: Missing date parameter")
 			http.Error(w, "Missing date parameter", http.StatusBadRequest)
 			return
 		}
 
 		w.Header().Set("Content-Type", "video/mp4")
-		inputPath := fmt.Sprintf("/mnt/dvr/camera1/%s_*.ts", dateStr) // Glob pattern
+		inputPath := fmt.Sprintf("/mnt/dvr/camera1/%s_*.ts", dateStr)
 		
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
 			"-pattern_type", "glob",
 			"-i", inputPath,
-			"-filter:v", "setpts=0.02*PTS", // Speed up 50x
-			"-an", // Drop audio
+			"-filter:v", "setpts=0.02*PTS",
+			"-an", 
 			"-c:v", "h264_qsv",
 			"-f", "mp4",
 			"-movflags", "frag_keyframe+empty_moov",
 			"pipe:1",
 		)
+		
+		var stderrBuf bytes.Buffer
 		cmd.Stdout = w
-		_ = cmd.Run()
+		cmd.Stderr = &stderrBuf
+		
+		if err := cmd.Run(); err != nil {
+			log.Printf("[TIMELAPSE] Execution failed for %s. Error: %v", dateStr, err)
+			log.Printf("[TIMELAPSE] Stderr Output:\n%s", stderrBuf.String())
+		} else {
+			log.Printf("[TIMELAPSE] Successfully generated file for %s", dateStr)
+		}
 	})
 
-	// Audio Intelligence: Extracts a clean 16kHz WAV for Whisper/Transcription pipelines
 	http.HandleFunc("/transcribe", func(w http.ResponseWriter, r *http.Request) {
 		streamURL := r.URL.Query().Get("url")
+		log.Printf("[TRANSCRIBE] Audio extraction requested for URL: %s", streamURL)
+		
 		if streamURL == "" {
+			log.Println("[TRANSCRIBE] Error: Missing url parameter")
 			http.Error(w, "Missing url parameter", http.StatusBadRequest)
 			return
 		}
@@ -339,17 +415,26 @@ func main() {
 		w.Header().Set("Content-Type", "audio/wav")
 		cmd := exec.CommandContext(r.Context(), "ffmpeg",
 			"-i", streamURL,
-			"-vn", // Drop video
+			"-vn", 
 			"-acodec", "pcm_s16le",
 			"-ar", "16000",
 			"-ac", "1",
 			"-f", "wav",
 			"pipe:1",
 		)
+		
+		var stderrBuf bytes.Buffer
 		cmd.Stdout = w
-		_ = cmd.Run()
+		cmd.Stderr = &stderrBuf
+		
+		if err := cmd.Run(); err != nil {
+			log.Printf("[TRANSCRIBE] Execution failed for %s. Error: %v", streamURL, err)
+			log.Printf("[TRANSCRIBE] Stderr Output:\n%s", stderrBuf.String())
+		} else {
+			log.Printf("[TRANSCRIBE] Successfully extracted 16kHz audio for %s", streamURL)
+		}
 	})
 
-	fmt.Println("Streaming server listening on :8080 (Internal HTTP) and :8443/udp (Public WebRTC)")
+	log.Println("[SYSTEM] HTTP routing initialized. Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
