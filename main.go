@@ -212,6 +212,10 @@ func main() {
 		}
 		
 		sentFirstFrame := false
+		var spsCache []byte
+		var ppsCache []byte
+		var frameBuffer bytes.Buffer
+
 		for {
 			nal, err := h264.NextNAL()
 			if err == io.EOF {
@@ -223,25 +227,54 @@ func main() {
 				break
 			}
 
-			if !sentFirstFrame {
-				log.Printf("[INGEST] [%s] SUCCESS: First H.264 NAL unit generated (Type: %d, Size: %d bytes)", station, nal.UnitType, len(nal.Data))
-				sentFirstFrame = true
+			// 1. Cache the Decoder Headers (SPS and PPS) in memory
+			if nal.UnitType == h264reader.NalUnitTypeSPS {
+				spsCache = append([]byte{}, nal.Data...)
+				continue
+			}
+			if nal.UnitType == h264reader.NalUnitTypePPS {
+				ppsCache = append([]byte{}, nal.Data...)
+				continue
 			}
 
-			isFrame := nal.UnitType == h264reader.NalUnitTypeCodedSliceNonIdr ||
-				nal.UnitType == h264reader.NalUnitTypeCodedSliceIdr
+			isIDR := nal.UnitType == h264reader.NalUnitTypeCodedSliceIdr
+			isNonIDR := nal.UnitType == h264reader.NalUnitTypeCodedSliceNonIdr
 
-			var duration time.Duration
-			if isFrame {
-				duration = time.Second / 15
-			}
+			if isIDR || isNonIDR {
+				if !sentFirstFrame {
+					log.Printf("[INGEST] [%s] SUCCESS: First H.264 Video Frame generated", station)
+					sentFirstFrame = true
+				}
 
-			tracksMu.RLock()
-			activeTracks := append([]*webrtc.TrackLocalStaticSample{}, tracks[station]...)
-			tracksMu.RUnlock()
+				frameBuffer.Reset()
 
-			for _, track := range activeTracks {
-				_ = track.WriteSample(media.Sample{Data: nal.Data, Duration: duration})
+				// 2. The "Late Joiner" Fix: If this is an IDR keyframe, prepend the cached SPS and PPS 
+				// with Annex-B start codes so any new viewer instantly initializes their decoder.
+				if isIDR {
+					if len(spsCache) > 0 {
+						frameBuffer.Write([]byte{0x00, 0x00, 0x00, 0x01})
+						frameBuffer.Write(spsCache)
+					}
+					if len(ppsCache) > 0 {
+						frameBuffer.Write([]byte{0x00, 0x00, 0x00, 0x01})
+						frameBuffer.Write(ppsCache)
+					}
+				}
+
+				// 3. Attach the actual video frame data
+				frameBuffer.Write([]byte{0x00, 0x00, 0x00, 0x01})
+				frameBuffer.Write(nal.Data)
+
+				payload := append([]byte{}, frameBuffer.Bytes()...)
+				duration := time.Second / 15
+
+				tracksMu.RLock()
+				activeTracks := append([]*webrtc.TrackLocalStaticSample{}, tracks[station]...)
+				tracksMu.RUnlock()
+
+				for _, track := range activeTracks {
+					_ = track.WriteSample(media.Sample{Data: payload, Duration: duration})
+				}
 			}
 		}
 
