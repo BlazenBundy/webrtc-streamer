@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -441,6 +442,186 @@ func main() {
 			log.Printf("[TRANSCRIBE] Successfully extracted 16kHz audio for %s", streamURL)
 		}
 	})
+
+	http.HandleFunc("/transcode-webrtc", handleWebRTC)
+
+	func handleWebRTC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	streamURL := r.URL.Query().Get("url")
+	if streamURL == "" {
+		http.Error(w, "Missing 'url' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	var offer webrtc.SessionDescription
+	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Use your existing Pion WebRTC API instance (configured with UDP :8443)
+	peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create a H.264 video track to send to the browser
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		"video",
+		"ms01-qsv-stream",
+	)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rtpSender, err := peerConnection.AddTrack(videoTrack)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Read incoming RTCP packets (required for congestion control / NACKs)
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
+
+	// Context to kill FFmpeg the moment the browser closes the WebRTC connection
+	ctx, cancel := context.WithCancel(context.Background())
+
+	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("[WEBRTC] ICE State changed: %s", state.String())
+		if state == webrtc.ICEConnectionStateConnected {
+			go streamQSVToWebRTC(ctx, streamURL, videoTrack)
+		}
+		if state == webrtc.ICEConnectionStateDisconnected ||
+			state == webrtc.ICEConnectionStateFailed ||
+			state == webrtc.ICEConnectionStateClosed {
+			cancel()
+			_ = peerConnection.Close()
+		}
+	})
+
+	if err := peerConnection.SetRemoteDescription(offer); err != nil {
+		cancel()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		cancel()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	if err := peerConnection.SetLocalDescription(answer); err != nil {
+		cancel()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	<-gatherComplete
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(*peerConnection.LocalDescription())
+	}
+
+	func streamQSVToWebRTC(ctx context.Context, streamURL string, videoTrack *webrtc.TrackLocalStaticSample) {
+		log.Printf("[WEBRTC-QSV] Starting real-time QSV pipeline for: %s", streamURL)
+
+		// Note: -re paces the input at 1x real-time speed.
+		// -bf 0 disables B-frames (WebRTC requires Baseline/Constrained Baseline without B-frames).
+		// -g 30 forces an IDR keyframe every 1 second so the browser locks on immediately.
+		cmd := exec.CommandContext(ctx, "ffmpeg",
+			"-re",
+			"-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+			"-init_hw_device", "qsv=qs@va",
+			"-filter_hw_device", "qs",
+			"-hwaccel", "qsv",
+			"-hwaccel_output_format", "qsv",
+			"-c:v", "h264_qsv",
+			"-i", streamURL,
+			"-vf", "scale_qsv=w=1280:h=-1",
+			"-c:v", "h264_qsv",
+			"-profile:v", "baseline",
+			"-bf", "0",
+			"-g", "30",
+			"-r", "30",
+			"-b:v", "2000k",
+			"-an",
+			"-f", "h264",
+			"pipe:1",
+		)
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("[WEBRTC-QSV] Pipe error: %v", err)
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[WEBRTC-QSV] FFmpeg start error: %v", err)
+			return
+		}
+
+		h264, err := h264reader.NewReader(stdout)
+		if err != nil {
+			log.Printf("[WEBRTC-QSV] H264Reader error: %v", err)
+			return
+		}
+
+		frameDuration := time.Second / 30
+		ticker := time.NewTicker(frameDuration)
+		defer ticker.Stop()
+
+		var frameBuffer bytes.Buffer
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Printf("[WEBRTC-QSV] Stopping QSV WebRTC stream")
+				return
+			default:
+				nal, err := h264.NextNAL()
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					log.Printf("[WEBRTC-QSV] NAL read error: %v", err)
+					return
+				}
+
+				// Re-attach the Annex-B start code before writing to the sample buffer
+				frameBuffer.Write([]byte{0x00, 0x00, 0x00, 0x01})
+				frameBuffer.Write(nal.Data)
+
+				// NalUnitType 1 (Coded slice of a non-IDR picture) or 5 (IDR picture)
+				// marks the actual video frame payload; SPS (7) and PPS (8) are bundled with it.
+				if nal.UnitType == h264reader.NalUnitTypeCodedSliceIdr ||
+					nal.UnitType == h264reader.NalUnitTypeCodedSliceNonIdr {
+
+					<-ticker.C
+					_ = videoTrack.WriteSample(media.Sample{
+						Data:     frameBuffer.Bytes(),
+						Duration: frameDuration,
+					})
+					frameBuffer.Reset()
+				}
+			}
+		}
+	}
 
 	log.Println("[SYSTEM] HTTP routing initialized. Listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
