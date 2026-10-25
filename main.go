@@ -31,7 +31,7 @@ func main() {
 	settingEngine := webrtc.SettingEngine{}
 
 	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   net.IP{0, 0, 0, 0},
+		IP:   net.ParseIP("::"),
 		Port: 8443,
 	})
 	if err != nil {
