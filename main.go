@@ -203,7 +203,6 @@ func main() {
 			"-preset", "ultrafast",
 			"-tune", "zerolatency",
 			"-threads", "1",
-			"-error_resilient", "1",
 			"-b:v", "1500k",
 			"-maxrate", "1500k",
 			"-bufsize", "750k",
