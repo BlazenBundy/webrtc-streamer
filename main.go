@@ -195,6 +195,8 @@ func main() {
 			"-analyzeduration", "0",
 			"-f", inputCodec,
 			"-i", "pipe:0",
+			"-reconnect", "1",
+			"-reconnect_stream_timeout", "2",
 			"-vf", "scale=1280:-2:flags=fast_bilinear",
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
