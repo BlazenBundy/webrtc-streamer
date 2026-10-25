@@ -65,9 +65,7 @@ func main() {
 			return
 		}
 
-		peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
-		})
+		peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{})
 		if err != nil {
 			log.Printf("[WEBRTC-OFFER] [%s] Error creating PeerConnection: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
