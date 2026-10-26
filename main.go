@@ -41,7 +41,14 @@ func main() {
 
 	log.Println("[SYSTEM] WebRTC UDP Listener bound to 0.0.0.0:8443")
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
-	settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
+	publicIP := os.Getenv("PUBLIC_IP")
+	if publicIP != "" {
+		log.Printf("[SYSTEM] Setting WebRTC NAT 1to1 public IP to: %s", publicIP)
+		settingEngine.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+	} else {
+		log.Println("[SYSTEM] WARNING: PUBLIC_IP not set, falling back to local IP 192.168.1.39")
+		settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
+	}
 
 	webrtcAPI = webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
