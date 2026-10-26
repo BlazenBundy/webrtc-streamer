@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,27 +29,73 @@ var (
 	webrtcAPI     *webrtc.API
 )
 
+// Automatically resolves the host's outbound LAN IP if no env var is set
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "192.168.1.39"
+	}
+	defer conn.Close()
+	if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return localAddr.IP.String()
+	}
+	return "192.168.1.39"
+}
+
+// Notifies eufy-bridge to put the camera back to sleep when no viewers remain
+func stopBridgeStream(station string, reason string) {
+	bridgeURL := strings.TrimRight(os.Getenv("EUFY_BRIDGE_URL"), "/")
+	if bridgeURL == "" {
+		bridgeURL = "http://eufy-bridge:3070"
+	}
+	stopURL := fmt.Sprintf("%s/stream/%s/stop", bridgeURL, station)
+	log.Printf("[BATTERY-GUARD] [%s] Stopping camera stream (%s) -> %s", station, reason, stopURL)
+
+	req, err := http.NewRequest(http.MethodPost, stopURL, nil)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err == nil && resp != nil {
+		resp.Body.Close()
+	}
+}
+
 func main() {
 	log.Println("[SYSTEM] Initializing MS-01 Media Engine...")
 	settingEngine := webrtc.SettingEngine{}
 
-	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   net.ParseIP("::"),
-		Port: 8443,
-	})
-	if err != nil {
-		log.Fatalf("[SYSTEM-FATAL] Failed to bind UDP port 8443: %v", err)
+	udpPort := 8443
+	if envPort := os.Getenv("UDP_PORT"); envPort != "" {
+		if parsed, err := strconv.Atoi(envPort); err == nil {
+			udpPort = parsed
+		}
 	}
 
-	log.Println("[SYSTEM] WebRTC UDP Listener bound to 0.0.0.0:8443")
+	udpListener, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP:   net.ParseIP("::"),
+		Port: udpPort,
+	})
+	if err != nil {
+		log.Fatalf("[SYSTEM-FATAL] Failed to bind UDP port %d: %v", udpPort, err)
+	}
+
+	log.Printf("[SYSTEM] WebRTC UDP Listener bound to 0.0.0.0:%d", udpPort)
 	settingEngine.SetICEUDPMux(webrtc.NewICEUDPMux(nil, udpListener))
-	publicIP := os.Getenv("PUBLIC_IP")
-	if publicIP != "" {
-		log.Printf("[SYSTEM] Setting WebRTC NAT 1to1 public IP to: %s", publicIP)
-		settingEngine.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
+
+	// Priority: PUBLIC_IP -> STREAMER_HOST_IP -> Auto-detected outbound LAN IP
+	hostIP := os.Getenv("PUBLIC_IP")
+	if hostIP == "" {
+		hostIP = os.Getenv("STREAMER_HOST_IP")
+	}
+	if hostIP != "" {
+		log.Printf("[SYSTEM] Setting WebRTC NAT 1to1 IP from env to: %s", hostIP)
+		settingEngine.SetNAT1To1IPs([]string{hostIP}, webrtc.ICECandidateTypeHost)
 	} else {
-		log.Println("[SYSTEM] WARNING: PUBLIC_IP not set, falling back to local IP 192.168.1.39")
-		settingEngine.SetNAT1To1IPs([]string{"192.168.1.39"}, webrtc.ICECandidateTypeHost)
+		detectedIP := getOutboundIP()
+		log.Printf("[SYSTEM] No PUBLIC_IP/STREAMER_HOST_IP set, using auto-detected IP: %s", detectedIP)
+		settingEngine.SetNAT1To1IPs([]string{detectedIP}, webrtc.ICECandidateTypeHost)
 	}
 
 	webrtcAPI = webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
@@ -56,9 +104,33 @@ func main() {
 	// 1. PRIMARY SECURITY CAMERA ROUTES
 	// =========================================================================
 
+	// Ground-truth active viewer count endpoint for eufy-bridge battery protection
+	http.HandleFunc("/viewers", func(w http.ResponseWriter, r *http.Request) {
+		station := r.URL.Query().Get("station")
+		tracksMu.RLock()
+		count := len(tracks[station])
+		tracksMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"station":%q,"viewers":%d}`, station, count)
+	})
+
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		station := r.URL.Query().Get("station")
-		log.Printf("[WEBRTC-OFFER] Incoming WebRTC connection request for station: '%s'", station)
+		viewerIP := r.URL.Query().Get("viewer_ip")
+		if viewerIP == "" {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				viewerIP = strings.TrimSpace(strings.Split(xff, ",")[0])
+			}
+		}
+		if viewerIP == "" {
+			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+				viewerIP = host
+			} else {
+				viewerIP = r.RemoteAddr
+			}
+		}
+
+		log.Printf("[WEBRTC-OFFER] Incoming WebRTC request for station: '%s' | Viewer IP: %s", station, viewerIP)
 
 		if station == "" {
 			http.Error(w, "Missing station query param", http.StatusBadRequest)
@@ -72,7 +144,11 @@ func main() {
 			return
 		}
 
-		peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{})
+		peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{
+			ICEServers: []webrtc.ICEServer{
+				{URLs: []string{"stun:stun.l.google.com:19302"}},
+			},
+		})
 		if err != nil {
 			log.Printf("[WEBRTC-OFFER] [%s] Error creating PeerConnection: %v", station, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -111,10 +187,21 @@ func main() {
 		viewerCount := len(tracks[station])
 		tracksMu.Unlock()
 
-		log.Printf("[WEBRTC-OFFER] [%s] Track added. Active viewers: %d", station, viewerCount)
+		log.Printf("[WEBRTC-OFFER] [%s] Track added for viewer %s. Active viewers: %d", station, viewerIP, viewerCount)
 
 		peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-			log.Printf("[WEBRTC-ICE] [%s] State changed to: %s", station, state.String())
+			icePathInfo := fmt.Sprintf("Viewer HTTP IP: %s", viewerIP)
+			if sctp := peerConnection.SCTP(); sctp != nil && sctp.Transport() != nil && sctp.Transport().ICETransport() != nil {
+				if pair, err := sctp.Transport().ICETransport().GetSelectedCandidatePair(); err == nil && pair != nil {
+					icePathInfo = fmt.Sprintf("Viewer HTTP IP: %s | UDP: %s:%d (%s) <-> Server UDP: %s:%d (%s)",
+						viewerIP,
+						pair.Remote.Address, pair.Remote.Port, pair.Remote.Typ.String(),
+						pair.Local.Address, pair.Local.Port, pair.Local.Typ.String(),
+					)
+				}
+			}
+
+			log.Printf("[WEBRTC-ICE] [%s] State changed to: %s | %s", station, state.String(), icePathInfo)
 
 			// Instant-On: Push cached SPS+PPS+IDR keyframe the millisecond ICE connects
 			if state == webrtc.ICEConnectionStateConnected {
@@ -144,8 +231,21 @@ func main() {
 				newCount := len(tracks[station])
 				tracksMu.Unlock()
 
-				log.Printf("[WEBRTC-ICE] [%s] Viewer disconnected. Remaining viewers: %d", station, newCount)
-				peerConnection.Close()
+				log.Printf("[WEBRTC-ICE] [%s] Viewer (%s) disconnected. Remaining viewers: %d", station, viewerIP, newCount)
+				_ = peerConnection.Close()
+
+				// Battery-Guard: If no viewers remain after a 5s grace window, put camera to sleep
+				if newCount == 0 {
+					go func(st string) {
+						time.Sleep(5 * time.Second)
+						tracksMu.RLock()
+						stillZero := len(tracks[st]) == 0
+						tracksMu.RUnlock()
+						if stillZero {
+							stopBridgeStream(st, "last WebRTC viewer disconnected")
+						}
+					}(station)
+				}
 			}
 		})
 
@@ -170,9 +270,9 @@ func main() {
 		}
 		<-gatherComplete
 
-		log.Printf("[WEBRTC-OFFER] [%s] Successfully negotiated WebRTC connection", station)
+		log.Printf("[WEBRTC-OFFER] [%s] Successfully negotiated WebRTC connection for %s", station, viewerIP)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(peerConnection.LocalDescription())
+		_ = json.NewEncoder(w).Encode(peerConnection.LocalDescription())
 	})
 
 	http.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
@@ -193,12 +293,16 @@ func main() {
 		}
 
 		startTime := time.Now()
+		lastViewerSeen := time.Now()
 		log.Printf("[INGEST] [%s] Receiving stream from bridge IP %s, codec: %s. Starting ultra-low-latency FFmpeg...", station, clientIP, inputCodec)
+
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
 
 		// Ultra-low-latency FFmpeg pipeline:
 		// -probesize 32768 & -analyzeduration 0 eliminate the 5-6s startup buffer
-		// -loglevel error silences the thousands of swscaler warnings
-		cmd := exec.CommandContext(r.Context(), "ffmpeg",
+		// -threads 1 prevents horizontal green-bar slice tearing on dropped UDP packets
+		cmd := exec.CommandContext(ctx, "ffmpeg",
 			"-hide_banner",
 			"-loglevel", "error",
 			"-fflags", "nobuffer+fastseek+flush_packets",
@@ -207,7 +311,6 @@ func main() {
 			"-analyzeduration", "0",
 			"-f", inputCodec,
 			"-i", "pipe:0",
-			"-reconnect", "1",
 			"-vf", "scale=1280:-2:flags=fast_bilinear",
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
@@ -307,6 +410,18 @@ func main() {
 				activeTracks := append([]*webrtc.TrackLocalStaticSample{}, tracks[station]...)
 				tracksMu.Unlock()
 
+				// Dead-man's switch: abort ingest if 0 viewers are connected for >15 seconds
+				if len(activeTracks) == 0 {
+					if time.Since(lastViewerSeen) > 15*time.Second {
+						log.Printf("[BATTERY-GUARD] [%s] 0 active WebRTC viewers for >15s during ingest. Terminating FFmpeg & stopping camera.", station)
+						cancel()
+						go stopBridgeStream(station, "0 active viewers during ingest")
+						break
+					}
+				} else {
+					lastViewerSeen = time.Now()
+				}
+
 				for _, track := range activeTracks {
 					_ = track.WriteSample(media.Sample{Data: payload, Duration: duration})
 				}
@@ -314,7 +429,7 @@ func main() {
 		}
 
 		err = cmd.Wait()
-		if err != nil {
+		if err != nil && ctx.Err() == nil {
 			log.Printf("[INGEST] [%s] FFmpeg exited with error: %v", station, err)
 		} else {
 			log.Printf("[INGEST] [%s] FFmpeg stream ended cleanly", station)
@@ -475,8 +590,12 @@ func main() {
 
 	http.HandleFunc("/transcode-webrtc", handleWebRTC)
 
-	log.Println("[SYSTEM] HTTP routing initialized. Listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	httpPort := os.Getenv("HTTP_PORT")
+	if httpPort == "" {
+		httpPort = "8080"
+	}
+	log.Printf("[SYSTEM] HTTP routing initialized. Listening on :%s", httpPort)
+	log.Fatal(http.ListenAndServe(":"+httpPort, nil))
 }
 
 func handleWebRTC(w http.ResponseWriter, r *http.Request) {
@@ -497,7 +616,11 @@ func handleWebRTC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{})
+	peerConnection, err := webrtcAPI.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
