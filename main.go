@@ -182,13 +182,18 @@ func main() {
 			return
 		}
 
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			clientIP = r.RemoteAddr
+		}
+
 		inputCodec := r.URL.Query().Get("codec")
 		if inputCodec != "h264" {
 			inputCodec = "hevc"
 		}
 
 		startTime := time.Now()
-		log.Printf("[INGEST] [%s] Receiving stream, codec: %s. Starting ultra-low-latency FFmpeg...", station, inputCodec)
+		log.Printf("[INGEST] [%s] Receiving stream from bridge IP %s, codec: %s. Starting ultra-low-latency FFmpeg...", station, clientIP, inputCodec)
 
 		// Ultra-low-latency FFmpeg pipeline:
 		// -probesize 32768 & -analyzeduration 0 eliminate the 5-6s startup buffer
@@ -272,7 +277,7 @@ func main() {
 
 			if isIDR || isNonIDR {
 				if !sentFirstFrame {
-					log.Printf("[INGEST] [%s] SUCCESS: First H.264 Frame generated in %v!", station, time.Since(startTime))
+					log.Printf("[INGEST] [%s] SUCCESS: First H.264 Frame generated in %v from bridge IP %s!", station, time.Since(startTime), clientIP)
 					sentFirstFrame = true
 				}
 
