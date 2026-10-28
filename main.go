@@ -311,19 +311,19 @@ func main() {
 			"-analyzeduration", "0",
 			"-f", inputCodec,
 			"-i", "pipe:0",
-			"-vf", "scale=1280:-2:flags=fast_bilinear",
+			"-vf", "scale=1280:-2:flags=bicubic", // 1. Sharper downscaling
 			"-c:v", "libx264",
 			"-pix_fmt", "yuv420p",
-			"-profile:v", "baseline",
+			"-profile:v", "baseline", // Keep baseline for strict WebRTC compatibility
 			"-level:v", "3.1",
-			"-preset", "ultrafast",
+			"-preset", "ultrafast",   // Keep ultrafast + 1 thread to prevent green screens
 			"-tune", "zerolatency",
 			"-threads", "1",
-			"-b:v", "1500k",
-			"-maxrate", "1500k",
-			"-bufsize", "750k",
-			"-g", "15",
-			"-keyint_min", "15",
+			"-crf", "20",             // 2. Quality-targeted encoding instead of starved CBR
+			"-maxrate", "4000k",      // 3. Headroom for detailed frames & PTZ motion
+			"-bufsize", "2000k",      // 4. 0.5s buffer window (keeps latency razor-thin)
+			"-g", "30",               // 5. Keyframe every ~1-2s instead of every 0.5s
+			"-keyint_min", "30",
 			"-sc_threshold", "0",
 			"-f", "h264",
 			"pipe:1",
