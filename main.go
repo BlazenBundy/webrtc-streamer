@@ -55,7 +55,7 @@
 		if err != nil {
 			return
 		}
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{Timeout: 15 * time.Second}
 		resp, err := client.Do(req)
 		if err == nil && resp != nil {
 			resp.Body.Close()
