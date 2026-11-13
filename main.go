@@ -55,12 +55,13 @@
 		if err != nil {
 			return
 		}
+		// Clone the default transport to keep Docker DNS, Keep-Alives, and IPv4/IPv6 dual-stack routing
+		customTransport := http.DefaultTransport.(*http.Transport).Clone()
+		customTransport.ResponseHeaderTimeout = 45 * time.Second
+
 		client := &http.Client{
-			Timeout: 0, // 0 means NO hard time limit on the video stream lifespan
-			Transport: &http.Transport{
-				// Wait up to 45 seconds for Eufy's slow P2P wakeup before giving up
-				ResponseHeaderTimeout: 45 * time.Second, 
-			},
+			Timeout: 0, // Still 0 so the video stream can run infinitely
+			Transport: customTransport,
 		}
 		resp, err := client.Do(req)
 		if err == nil && resp != nil {
